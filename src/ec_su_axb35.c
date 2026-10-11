@@ -3,6 +3,7 @@
 #include <linux/acpi.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/dmi.h>
 #include <linux/fs.h>
 #include <linux/hwmon.h>
 #include <linux/init.h>
@@ -76,6 +77,131 @@ static struct ec_apu ec_apu = {
     .name           = "apu",
     .power_mode_reg = 0x31,
 };
+
+/*
+ * Load guard. The driver writes EC registers, so it only loads on a board
+ * and EC firmware whose register map has been checked. Anything else gets
+ * -ENODEV, unless the admin names it with the allow_board parameter.
+ */
+#define EC_REG_FW_MAJOR 0x00
+#define EC_REG_FW_MINOR 0x01
+
+struct ec_board {
+    const char *sys_vendor;
+    const char *product_name;
+    const char *chassis_vendor;
+    u8          ec_major;
+    u8          ec_minor;
+};
+
+static const struct ec_board ec_known_boards[] = {
+    /*
+     * GMKtec EVO-X2 (Sixunited AXB35-02), BIOS 1.05, EC firmware 1.6: map
+     * checked against the DSDT and a read-only EC RAM peek.
+     */
+    { "GMKtec", "NucBox_EVO-X2", "SU", 1, 6 },
+};
+
+static char *allow_board;
+module_param(allow_board, charp, 0444);
+MODULE_PARM_DESC(allow_board,
+                 "Also load on this known-good board: "
+                 "\"sys_vendor:product_name:chassis_vendor:EC_MAJOR.EC_MINOR\"");
+
+static bool ec_board_matches(const struct ec_board *board, u8 ec_major,
+                             u8 ec_minor)
+{
+    return dmi_match(DMI_SYS_VENDOR, board->sys_vendor) &&
+           dmi_match(DMI_PRODUCT_NAME, board->product_name) &&
+           dmi_match(DMI_CHASSIS_VENDOR, board->chassis_vendor) &&
+           board->ec_major == ec_major && board->ec_minor == ec_minor;
+}
+
+/* Parses allow_board in place: "vendor:product:chassis_vendor:MAJOR.MINOR" */
+static int ec_parse_board(char *s, struct ec_board *board)
+{
+    char *ver;
+    char *major;
+
+    board->sys_vendor     = strsep(&s, ":");
+    board->product_name   = strsep(&s, ":");
+    board->chassis_vendor = strsep(&s, ":");
+    ver                   = strsep(&s, ":");
+    if (!ver || s || !*board->sys_vendor || !*board->product_name ||
+        !*board->chassis_vendor)
+        return -EINVAL;
+
+    major = strsep(&ver, ".");
+    if (!ver || kstrtou8(major, 10, &board->ec_major) ||
+        kstrtou8(ver, 10, &board->ec_minor))
+        return -EINVAL;
+
+    return 0;
+}
+
+static int ec_check_board(void)
+{
+    const char     *smbios_ec;
+    char            ec_ver[8];
+    struct ec_board extra;
+    char           *buf;
+    u8              major;
+    u8              minor;
+    int             ret;
+    int             i;
+
+    ret = ec_read(EC_REG_FW_MAJOR, &major);
+    if (!ret)
+        ret = ec_read(EC_REG_FW_MINOR, &minor);
+    if (ret) {
+        pr_err("ec_su_axb35: cannot read the EC firmware version (%d), "
+               "refusing to load\n",
+               ret);
+        return -ENODEV;
+    }
+    snprintf(ec_ver, sizeof(ec_ver), "%u.%u", major, minor);
+
+    /* SMBIOS type 0 also reports the EC release; when present it must agree */
+    smbios_ec = dmi_get_system_info(DMI_EC_FIRMWARE_RELEASE);
+    if (smbios_ec && strcmp(smbios_ec, ec_ver)) {
+        pr_err("ec_su_axb35: EC RAM says firmware %s but SMBIOS says %s, "
+               "refusing to load\n",
+               ec_ver, smbios_ec);
+        return -ENODEV;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(ec_known_boards); i++)
+        if (ec_board_matches(&ec_known_boards[i], major, minor))
+            return 0;
+
+    if (allow_board) {
+        /* extra's strings point into buf, so match before freeing it */
+        buf = kstrdup(allow_board, GFP_KERNEL);
+        if (!buf)
+            return -ENOMEM;
+
+        ret = ec_parse_board(buf, &extra);
+        if (!ret && ec_board_matches(&extra, major, minor)) {
+            pr_warn("ec_su_axb35: board allowed by allow_board=\"%s\"\n",
+                    allow_board);
+            kfree(buf);
+            return 0;
+        }
+        kfree(buf);
+        if (ret) {
+            pr_err("ec_su_axb35: cannot parse allow_board=\"%s\"\n",
+                   allow_board);
+            return ret;
+        }
+    }
+
+    pr_err("ec_su_axb35: unsupported board \"%s\" \"%s\" chassis vendor "
+           "\"%s\" EC firmware %s, refusing to load (see allow_board)\n",
+           dmi_get_system_info(DMI_SYS_VENDOR) ?: "",
+           dmi_get_system_info(DMI_PRODUCT_NAME) ?: "",
+           dmi_get_system_info(DMI_CHASSIS_VENDOR) ?: "", ec_ver);
+    return -ENODEV;
+}
 
 static int ec_fan_read_rpm(const struct ec_fan *fan, u16 *rpm)
 {
@@ -661,6 +787,10 @@ static int __init ec_su_axb35_init(void)
     int ret;
 
     BUILD_BUG_ON(ARRAY_SIZE(ec_hwmon_fan_config) != ARRAY_SIZE(ec_fans) + 1);
+
+    ret = ec_check_board();
+    if (ret)
+        return ret;
 
     ret = alloc_chrdev_region(&ec_su_axb35_dev, 0, EC_NUM_DEVICES,
                               "ec_su_axb35");
