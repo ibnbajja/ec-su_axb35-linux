@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""ec-su_axb35-check - sample the Strix Halo iGPU and the EC fans, then summarize.
+
+Reads the iGPU's amdgpu gpu_metrics (format v3.0) and the ec_su_axb35 hwmon
+device every --interval seconds for --minutes, then prints:
+average gfxclk, gfx temperature, thm_gfx/thm_core throttle residency %, socket
+power, gfx activity, EC temperature and fan RPMs. Use it for A/B runs of fan
+settings under the same load. Without the module loaded, the EC columns are n/a.
+
+  ec-su_axb35-check --minutes 10 --label curve --csv /tmp/curve.csv
+"""
+import argparse
+import ctypes
+import csv
+import glob
+import json
+import os
+import re
+import statistics
+import sys
+import time
+
+u16, u32, u64 = ctypes.c_uint16, ctypes.c_uint32, ctypes.c_uint64
+
+
+class GpuMetricsV3(ctypes.Structure):
+    """struct gpu_metrics_v3_0 from drivers/gpu/drm/amd/include/kgd_pp_interface.h."""
+
+    _fields_ = [
+        ("structure_size", u16), ("format_revision", ctypes.c_uint8), ("content_revision", ctypes.c_uint8),
+        ("temperature_gfx", u16), ("temperature_soc", u16), ("temperature_core", u16 * 16), ("temperature_skin", u16),
+        ("average_gfx_activity", u16), ("average_vcn_activity", u16), ("average_ipu_activity", u16 * 8),
+        ("average_core_c0_activity", u16 * 16), ("average_dram_reads", u16), ("average_dram_writes", u16),
+        ("average_ipu_reads", u16), ("average_ipu_writes", u16),
+        ("system_clock_counter", u64),
+        ("average_socket_power", u32), ("average_ipu_power", u16), ("average_apu_power", u32),
+        ("average_gfx_power", u32), ("average_dgpu_power", u32), ("average_all_core_power", u32),
+        ("average_core_power", u16 * 16), ("average_sys_power", u16), ("stapm_power_limit", u16),
+        ("current_stapm_power_limit", u16),
+        ("average_gfxclk_frequency", u16), ("average_socclk_frequency", u16), ("average_vpeclk_frequency", u16),
+        ("average_ipuclk_frequency", u16), ("average_fclk_frequency", u16), ("average_vclk_frequency", u16),
+        ("average_uclk_frequency", u16), ("average_mpipu_frequency", u16),
+        ("current_coreclk", u16 * 16), ("current_core_maxfreq", u16), ("current_gfx_maxfreq", u16),
+        ("throttle_residency_prochot", u32), ("throttle_residency_spl", u32), ("throttle_residency_fppt", u32),
+        ("throttle_residency_sppt", u32), ("throttle_residency_thm_core", u32), ("throttle_residency_thm_gfx", u32),
+        ("throttle_residency_thm_soc", u32), ("time_filter_alphavalue", u32),
+    ]
+
+
+# Throttle residency counters are cumulative milliseconds (u32): on llm thm_gfx
+# grew ~19,950 over a 20 s fully throttled window. system_clock_counter is ns.
+THROTTLE = ("prochot", "spl", "fppt", "sppt", "thm_core", "thm_gfx", "thm_soc")
+NA16 = 0xFFFF
+FANS = (1, 2, 3)
+
+
+def find_gpu_metrics():
+    for path in sorted(glob.glob("/sys/class/drm/card*/device/gpu_metrics")):
+        if not re.search(r"/card\d+/", path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4)
+        except OSError:
+            continue
+        if len(head) == 4 and head[2] == 3 and head[3] == 0:
+            return path
+    return None
+
+
+def find_hwmon():
+    for name in glob.glob("/sys/class/hwmon/hwmon*/name"):
+        try:
+            with open(name) as f:
+                if f.read().strip() == "ec_su_axb35":
+                    return os.path.dirname(name)
+        except OSError:
+            pass
+    return None
+
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_str(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_metrics(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < ctypes.sizeof(GpuMetricsV3):
+        raise SystemExit(f"{path}: {len(raw)} bytes, expected >= {ctypes.sizeof(GpuMetricsV3)} (v3.0)")
+    m = GpuMetricsV3.from_buffer_copy(raw[: ctypes.sizeof(GpuMetricsV3)])
+    if (m.format_revision, m.content_revision) != (3, 0):
+        raise SystemExit(f"{path}: gpu_metrics v{m.format_revision}.{m.content_revision}, expected v3.0")
+    return m
+
+
+def sample(metrics_path, hwmon, ec_sysfs):
+    m = read_metrics(metrics_path)
+    row = {
+        "t": time.time(),
+        "clock_ns": m.system_clock_counter,
+        "gfx_temp_c": m.temperature_gfx / 100 if m.temperature_gfx != NA16 else None,
+        "gfxclk_mhz": m.average_gfxclk_frequency if m.average_gfxclk_frequency != NA16 else None,
+        "gfx_activity_pct": m.average_gfx_activity if m.average_gfx_activity != NA16 else None,
+        "socket_w": m.average_socket_power / 1000,
+    }
+    for t in THROTTLE:
+        row["thr_" + t] = getattr(m, "throttle_residency_" + t)
+    temp = read_int(f"{hwmon}/temp1_input") if hwmon else None
+    row["ec_temp_c"] = temp / 1000 if temp is not None else None
+    for n in FANS:
+        row[f"fan{n}_rpm"] = read_int(f"{hwmon}/fan{n}_input") if hwmon else None
+        row[f"fan{n}_level"] = read_int(f"{ec_sysfs}/fan{n}/level")
+        row[f"fan{n}_mode"] = read_str(f"{ec_sysfs}/fan{n}/mode")
+    return row
+
+
+def mean(rows, key):
+    vals = [r[key] for r in rows if r[key] is not None]
+    return round(statistics.fmean(vals), 1) if vals else None
+
+
+def peak(rows, key):
+    vals = [r[key] for r in rows if r[key] is not None]
+    return max(vals) if vals else None
+
+
+def residency_pct(first, last, key):
+    elapsed_ms = (last["clock_ns"] - first["clock_ns"]) / 1e6
+    if elapsed_ms <= 0:
+        return None
+    delta = (last[key] - first[key]) % 2**32
+    return round(min(100.0, 100 * delta / elapsed_ms), 1)
+
+
+def summarize(rows, label):
+    first, last = rows[0], rows[-1]
+    s = {
+        "label": label,
+        "samples": len(rows),
+        "seconds": round((last["clock_ns"] - first["clock_ns"]) / 1e9, 1),
+        "gfxclk_mhz_avg": mean(rows, "gfxclk_mhz"),
+        "gfx_temp_c_avg": mean(rows, "gfx_temp_c"),
+        "gfx_temp_c_max": peak(rows, "gfx_temp_c"),
+        "gfx_activity_pct_avg": mean(rows, "gfx_activity_pct"),
+        "socket_w_avg": mean(rows, "socket_w"),
+        "ec_temp_c_avg": mean(rows, "ec_temp_c"),
+        "ec_temp_c_max": peak(rows, "ec_temp_c"),
+    }
+    for t in THROTTLE:
+        s[f"{t}_residency_pct"] = residency_pct(first, last, "thr_" + t)
+    for n in FANS:
+        s[f"fan{n}_rpm_avg"] = mean(rows, f"fan{n}_rpm")
+        s[f"fan{n}_level_avg"] = mean(rows, f"fan{n}_level")
+        s[f"fan{n}_mode_last"] = last[f"fan{n}_mode"]
+    return s
+
+
+def fmt(v, unit=""):
+    return "n/a" if v is None else f"{v}{unit}"
+
+
+def print_summary(s):
+    print(f"== {s['label'] or 'run'}: {s['samples']} samples over {s['seconds']} s")
+    print(f"gfxclk avg        {fmt(s['gfxclk_mhz_avg'], ' MHz')}")
+    print(f"gfx temp          avg {fmt(s['gfx_temp_c_avg'], ' °C')}, max {fmt(s['gfx_temp_c_max'], ' °C')}")
+    print(f"thm_gfx residency {fmt(s['thm_gfx_residency_pct'], ' %')} "
+          f"(thm_core {fmt(s['thm_core_residency_pct'], ' %')}, spl {fmt(s['spl_residency_pct'], ' %')}, "
+          f"fppt {fmt(s['fppt_residency_pct'], ' %')}, sppt {fmt(s['sppt_residency_pct'], ' %')})")
+    print(f"socket power avg  {fmt(s['socket_w_avg'], ' W')}")
+    print(f"gfx activity avg  {fmt(s['gfx_activity_pct_avg'], ' %')}")
+    print(f"EC temp           avg {fmt(s['ec_temp_c_avg'], ' °C')}, max {fmt(s['ec_temp_c_max'], ' °C')}")
+    for n in FANS:
+        print(f"fan{n}              {fmt(s[f'fan{n}_rpm_avg'], ' rpm')}, level avg {fmt(s[f'fan{n}_level_avg'])}, "
+              f"mode {fmt(s[f'fan{n}_mode_last'])}")
+    print("json " + json.dumps(s, sort_keys=True))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--minutes", type=float, default=10)
+    ap.add_argument("--interval", type=float, default=1, help="seconds between samples (default 1)")
+    ap.add_argument("--label", default="", help="name for this run, e.g. baseline or curve")
+    ap.add_argument("--csv", help="also write every sample to this CSV file")
+    ap.add_argument("--gpu-metrics", help="gpu_metrics file (default: the v3.0 one under /sys/class/drm)")
+    ap.add_argument("--hwmon", help="hwmon dir of ec_su_axb35 (default: found by name)")
+    ap.add_argument("--ec-sysfs", default="/sys/class/ec_su_axb35")
+    args = ap.parse_args()
+
+    metrics_path = args.gpu_metrics or find_gpu_metrics()
+    if not metrics_path:
+        sys.exit("no gpu_metrics v3.0 file found under /sys/class/drm")
+    hwmon = args.hwmon or find_hwmon()
+    print(f"gpu_metrics {metrics_path}; hwmon {hwmon or 'n/a (ec_su_axb35 not loaded)'}", file=sys.stderr)
+
+    rows = []
+    end = time.monotonic() + args.minutes * 60
+    next_t = time.monotonic()
+    try:
+        while True:
+            rows.append(sample(metrics_path, hwmon, args.ec_sysfs))
+            next_t += args.interval
+            if next_t > end:
+                break
+            time.sleep(max(0.0, next_t - time.monotonic()))
+    except KeyboardInterrupt:
+        print("interrupted, summarizing what was sampled", file=sys.stderr)
+
+    if len(rows) < 2:
+        sys.exit("need at least two samples")
+    if args.csv:
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+    print_summary(summarize(rows, args.label))
+
+
+if __name__ == "__main__":
+    main()
