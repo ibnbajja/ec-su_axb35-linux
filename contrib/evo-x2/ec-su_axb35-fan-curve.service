@@ -1,0 +1,16 @@
+[Unit]
+Description=Fan curves for the Sixunited AXB35 EC (ec_su_axb35)
+Documentation=file:/etc/ec-su_axb35/fan-curve.conf
+# dkms.service may build the module for a new kernel at boot
+After=dkms.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/sbin/modprobe ec_su_axb35
+ExecStart=/usr/local/libexec/ec-su_axb35-fan-curve start
+# Hands the fans back to the EC's own control; the module stays loaded
+ExecStop=/usr/local/libexec/ec-su_axb35-fan-curve stop
+
+[Install]
+WantedBy=multi-user.target

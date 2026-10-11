@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# ec-su_axb35-fan-curve - apply or release the fan curves from
+# /etc/ec-su_axb35/fan-curve.conf (installed as /usr/local/libexec/).
+#
+#   start   fan1-3: write both curves, then mode=curve
+#   stop    fan1-3: mode=auto (the EC's own fan control)
+#   status  print temperature, mode, level, rpm and curves
+#
+# Run by ec-su_axb35-fan-curve.service. Never writes apu/power_mode.
+# EC_FAN_CURVE_CONF and EC_SU_AXB35_SYSFS override the paths (for testing).
+set -euo pipefail
+
+CONF=${EC_FAN_CURVE_CONF:-/etc/ec-su_axb35/fan-curve.conf}
+SYS=${EC_SU_AXB35_SYSFS:-/sys/class/ec_su_axb35}
+FANS=(1 2 3)
+
+declare -A CURVE
+
+log() { echo "ec-su_axb35-fan-curve: $*" >&2; }
+
+# put FILE VALUE: write VALUE to a sysfs attribute; the driver rejects bad values
+put() {
+    if ! printf '%s\n' "$2" 2>/dev/null >"$1"; then
+        log "writing \"$2\" to $1 failed"
+        return 1
+    fi
+}
+
+# Reads FAN<n>_RAMPUP / FAN<n>_RAMPDOWN for every fan; anything else is an error.
+read_conf() {
+    local line n k
+
+    [[ -r $CONF ]] || { log "cannot read $CONF"; return 1; }
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%#*}
+        line=${line//[[:space:]]/}
+        [[ -z $line ]] && continue
+        if [[ $line =~ ^(FAN[123]_RAMP(UP|DOWN))=\"?([0-9]+(,[0-9]+){4})\"?$ ]]; then
+            CURVE[${BASH_REMATCH[1]}]=${BASH_REMATCH[3]}
+        else
+            log "$CONF: cannot parse \"$line\""
+            return 1
+        fi
+    done <"$CONF"
+
+    for n in "${FANS[@]}"; do
+        for k in RAMPUP RAMPDOWN; do
+            [[ -n ${CURVE[FAN${n}_$k]:-} ]] || { log "$CONF: FAN${n}_$k missing"; return 1; }
+        done
+    done
+}
+
+apply_fan() {
+    local n=$1 d=$SYS/fan$1
+    local up=${CURVE[FAN${1}_RAMPUP]} down=${CURVE[FAN${1}_RAMPDOWN]}
+
+    # The driver checks each new curve against the fan's other curve. A zero
+    # rampdown fits under any valid rampup, so this order works from any state.
+    put "$d/rampdown_curve" 0,0,0,0,0 || return 1
+    put "$d/rampup_curve" "$up" || return 1
+    put "$d/rampdown_curve" "$down" || return 1
+    if [[ $(<"$d/rampup_curve") != "$up" || $(<"$d/rampdown_curve") != "$down" ]]; then
+        log "fan$n: curves read back differently"
+        return 1
+    fi
+
+    put "$d/mode" curve || return 1
+    [[ $(<"$d/mode") == curve ]] || { log "fan$n: mode is not curve"; return 1; }
+    log "fan$n: mode curve, level $(<"$d/level"), rampup $up, rampdown $down"
+}
+
+start() {
+    local n
+
+    read_conf
+    [[ -d $SYS ]] || { log "$SYS missing: is ec_su_axb35 loaded?"; return 1; }
+    for n in "${FANS[@]}"; do
+        if ! apply_fan "$n"; then
+            log "fan$n: curve not applied; handing all fans back to EC auto"
+            stop || true
+            return 1
+        fi
+    done
+}
+
+stop() {
+    local n rc=0
+
+    [[ -d $SYS ]] || { log "$SYS missing: nothing to release"; return 0; }
+    for n in "${FANS[@]}"; do
+        put "$SYS/fan$n/mode" auto || rc=1
+    done
+    [[ $rc -eq 0 ]] && log "fan1-3: mode auto"
+    return $rc
+}
+
+status() {
+    local n d
+
+    [[ -d $SYS ]] || { log "$SYS missing: is ec_su_axb35 loaded?"; return 1; }
+    echo "temp $(<"$SYS/temp1/temp") °C (min $(<"$SYS/temp1/min"), max $(<"$SYS/temp1/max"))"
+    for n in "${FANS[@]}"; do
+        d=$SYS/fan$n
+        echo "fan$n: mode $(<"$d/mode") level $(<"$d/level") rpm $(<"$d/rpm")" \
+            "rampup $(<"$d/rampup_curve") rampdown $(<"$d/rampdown_curve")"
+    done
+}
+
+case ${1:-} in
+start) start ;;
+stop) stop ;;
+status) status ;;
+*)
+    echo "usage: ${0##*/} start|stop|status" >&2
+    exit 2
+    ;;
+esac
