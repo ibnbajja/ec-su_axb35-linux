@@ -243,11 +243,14 @@ static ssize_t fan_rpm_show(struct device *dev, struct device_attribute *attr,
 static struct device_attribute dev_attr_fan_rpm =
     __ATTR(rpm, 0444, fan_rpm_show, NULL);
 
-static void update_fan_mode(struct ec_fan *fan)
+static int update_fan_mode(struct ec_fan *fan)
 {
-    u8 val;
-    // TODO: handle error
-    ec_read(fan->mode_reg, &val);
+    u8  val;
+    int ret;
+
+    ret = ec_read(fan->mode_reg, &val);
+    if (ret)
+        return ret;
 
     switch (val) {
     case 0x10:
@@ -268,16 +271,21 @@ static void update_fan_mode(struct ec_fan *fan)
         }
         break;
     }
+
+    return 0;
 }
 
 static ssize_t fan_mode_show(struct device *dev, struct device_attribute *attr,
                              char *buf)
 {
-    struct ec_fan *fan = dev_get_drvdata(dev);
+    struct ec_fan *fan  = dev_get_drvdata(dev);
+    const char    *mode = "unknown";
+    int            ret;
 
-    update_fan_mode(fan);
+    ret = update_fan_mode(fan);
+    if (ret)
+        return ret;
 
-    const char *mode = "unknown";
     switch (fan->mode) {
     case AUTO:
         mode = "auto";
@@ -293,37 +301,54 @@ static ssize_t fan_mode_show(struct device *dev, struct device_attribute *attr,
     return sprintf(buf, "%s\n", mode);
 }
 
-static u8 read_fan_level(struct ec_fan *fan)
+static int read_fan_level(struct ec_fan *fan, u8 *level)
 {
-    u8 val;
-    // TODO: handle error
-    ec_read(fan->mode_reg + 1, &val);
+    u8  val;
+    int ret;
+
+    ret = ec_read(fan->mode_reg + 1, &val);
+    if (ret)
+        return ret;
 
     switch (val & 0xF) {
     case 0x2: // 20%
-        return 1;
+        *level = 1;
+        break;
     case 0x3: // 40%
-        return 2;
+        *level = 2;
+        break;
     case 0x4: // 60%
-        return 3;
+        *level = 3;
+        break;
     case 0x5: // 80%
-        return 4;
+        *level = 4;
+        break;
     case 0x6: // 100%
-        return 5;
+        *level = 5;
+        break;
     case 0x7:
     default: // off
-        return 0;
+        *level = 0;
     }
+
+    return 0;
 }
 
 static ssize_t fan_level_show(struct device *dev, struct device_attribute *attr,
                               char *buf)
 {
     struct ec_fan *fan = dev_get_drvdata(dev);
-    return sprintf(buf, "%u\n", read_fan_level(fan));
+    u8             level;
+    int            ret;
+
+    ret = read_fan_level(fan, &level);
+    if (ret)
+        return ret;
+
+    return sprintf(buf, "%u\n", level);
 }
 
-static void write_fan_level(struct ec_fan *fan, u8 level)
+static int write_fan_level(struct ec_fan *fan, u8 level)
 {
     u8 val;
 
@@ -337,6 +362,8 @@ static void write_fan_level(struct ec_fan *fan, u8 level)
     case 0x25:
         val = 0x30;
         break;
+    default:
+        return -EINVAL;
     }
 
     switch (level) {
@@ -360,8 +387,7 @@ static void write_fan_level(struct ec_fan *fan, u8 level)
         val += 0x6;
     }
 
-    // TODO: handle error
-    ec_write(fan->mode_reg + 1, val);
+    return ec_write(fan->mode_reg + 1, val);
 }
 
 static ssize_t fan_level_store(struct device           *dev,
@@ -370,11 +396,14 @@ static ssize_t fan_level_store(struct device           *dev,
 {
     struct ec_fan *fan = dev_get_drvdata(dev);
     u8             val;
+    int            ret;
 
-    if (kstrtou8(buf, 10, &val))
+    if (kstrtou8(buf, 10, &val) || val > 5)
         return -EINVAL;
 
-    write_fan_level(fan, val);
+    ret = write_fan_level(fan, val);
+    if (ret)
+        return ret;
 
     return count;
 }
@@ -386,21 +415,22 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
                               const char *buf, size_t count)
 {
     struct ec_fan *fan = dev_get_drvdata(dev);
+    enum fan_mode  mode;
     u8             val;
+    int            ret;
 
     if (sysfs_streq(buf, "auto")) {
-        fan->mode = AUTO;
+        mode = AUTO;
     } else if (sysfs_streq(buf, "fixed")) {
-        fan->mode = FIXED;
+        mode = FIXED;
     } else if (sysfs_streq(buf, "curve")) {
-        fan->mode = CURVE;
+        mode = CURVE;
     } else {
         return -EINVAL;
     }
 
-    switch (fan->mode) {
+    switch (mode) {
     case AUTO:
-        fan->mode = AUTO;
         switch (fan->mode_reg) {
         case 0x21:
             val = 0x10;
@@ -417,6 +447,7 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
         break;
     case FIXED:
     case CURVE:
+    default:
         switch (fan->mode_reg) {
         case 0x21:
             val = 0x11;
@@ -433,18 +464,21 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
         break;
     }
 
-    // TODO: handle error
-    ec_write(fan->mode_reg, val);
+    ret = ec_write(fan->mode_reg, val);
+    if (ret)
+        return ret;
+    fan->mode = mode;
 
     // When switching to CURVE mode, set initial fan level based on current temperature
-    // to prevent RPM burst from inappropriate starting level
+    // to prevent RPM burst from inappropriate starting level.
+    // If the temperature cannot be read, the worker positions the fan instead.
     if (fan->mode == CURVE) {
         u8 temp;
-        // TODO: handle error
+
         if (ec_read(ec_temp.reg, &temp) == 0) {
-            u8 initial_level = 0;
+            u8  initial_level = 0;
             int i;
-            
+
             // Find the appropriate level based on current temperature
             // Use rampup curve for initial positioning to be more responsive
             for (i = 5; i > 0; i--) {
@@ -453,8 +487,10 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
                     break;
                 }
             }
-            
-            write_fan_level(fan, initial_level);
+
+            ret = write_fan_level(fan, initial_level);
+            if (ret)
+                return ret;
         }
     }
 
@@ -560,8 +596,12 @@ static ssize_t temp_current_show(struct device           *dev,
 {
     struct ec_temp *temp = dev_get_drvdata(dev);
     u8              val;
-    // TODO: handle error
-    ec_read(temp->reg, &val);
+    int             ret;
+
+    ret = ec_read(temp->reg, &val);
+    if (ret)
+        return ret;
+
     return sprintf(buf, "%u\n", val);
 }
 
@@ -591,12 +631,15 @@ static struct device_attribute dev_attr_temp_max =
 static ssize_t apu_power_mode_show(struct device           *dev,
                                    struct device_attribute *attr, char *buf)
 {
-    struct ec_apu *apu = dev_get_drvdata(dev);
+    struct ec_apu *apu  = dev_get_drvdata(dev);
+    const char    *mode = "unknown";
     u8             val;
-    // TODO: handle error
-    ec_read(apu->power_mode_reg, &val);
+    int            ret;
 
-    const char *mode = "unknown";
+    ret = ec_read(apu->power_mode_reg, &val);
+    if (ret)
+        return ret;
+
     switch (val) {
     case 0x00:
         mode = "balanced";
@@ -620,6 +663,8 @@ static ssize_t apu_power_mode_store(struct device           *dev,
 {
     struct ec_apu *apu = dev_get_drvdata(dev);
     u8             val;
+    int            ret;
+
     if (sysfs_streq(buf, "balanced")) {
         val = 0x00;
     } else if (sysfs_streq(buf, "performance")) {
@@ -630,7 +675,10 @@ static ssize_t apu_power_mode_store(struct device           *dev,
         return -EINVAL;
     }
 
-    ec_write(apu->power_mode_reg, val);
+    ret = ec_write(apu->power_mode_reg, val);
+    if (ret)
+        return ret;
+
     return count;
 }
 
@@ -743,10 +791,19 @@ static struct delayed_work ec_update_work;
 
 static void ec_update_worker(struct work_struct *work)
 {
-    u8 temp;
-    // TODO: handle error
-    ec_read(ec_temp.reg, &temp);
+    u8  temp;
     int i;
+    int ret;
+
+    ret = ec_read(ec_temp.reg, &temp);
+    if (ret) {
+        // Without a temperature the curve cannot be evaluated: keep the
+        // current fan levels and try again on the next tick.
+        pr_warn_ratelimited("ec_su_axb35: temperature read failed (%d), "
+                            "fan levels unchanged\n",
+                            ret);
+        goto requeue;
+    }
 
     // Update min/max
     if (ec_temp.temp_min == 0 || temp < ec_temp.temp_min)
@@ -760,14 +817,25 @@ static void ec_update_worker(struct work_struct *work)
         struct ec_fan *fan = &ec_fans[i];
 
         if (fan->mode == CURVE) {
-            u8 level = read_fan_level(fan);
+            u8 level;
+
+            if (read_fan_level(fan, &level))
+                continue;
+
+            ret = 0;
+
             if (level < 5 && temp >= fan->rampup_curve[level + 1]) {
-                write_fan_level(fan, level + 1);
-            } else if (level > 0 && temp <= fan->rampdown_curve[level])
-                write_fan_level(fan, level - 1);
+                ret = write_fan_level(fan, level + 1);
+            } else if (level > 0 && temp <= fan->rampdown_curve[level]) {
+                ret = write_fan_level(fan, level - 1);
+            }
+            if (ret)
+                pr_warn_ratelimited("ec_su_axb35: %s level write failed (%d)\n",
+                                    fan->name, ret);
         }
     }
 
+requeue:
     // Requeue the work
     schedule_delayed_work(&ec_update_work,
                           msecs_to_jiffies(1000)); // every 1 sec
@@ -905,8 +973,11 @@ static void __exit ec_su_axb35_exit(void)
         default:
             continue;
         }
-        ec_write(fan->mode_reg, val);
-        pr_info("ec_su_axb35: %s reset to AUTO mode\n", fan->name);
+        if (ec_write(fan->mode_reg, val))
+            pr_err("ec_su_axb35: %s could not be reset to AUTO mode\n",
+                   fan->name);
+        else
+            pr_info("ec_su_axb35: %s reset to AUTO mode\n", fan->name);
     }
 
     for (i = 0; i < ARRAY_SIZE(ec_fans); i++) {
