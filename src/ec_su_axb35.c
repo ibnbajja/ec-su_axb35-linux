@@ -82,6 +82,17 @@ static struct ec_apu ec_apu = {
 static DEFINE_MUTEX(ec_curve_lock);
 
 /*
+ * Lowest level the curve may set. The default 1 (20%) keeps the fans
+ * spinning in curve mode; 0 restores the old behavior of stopping them.
+ * Fixed mode is not limited.
+ */
+static unsigned int curve_min_level = 1;
+module_param(curve_min_level, uint, 0444);
+MODULE_PARM_DESC(curve_min_level,
+                 "Lowest fan level in curve mode, 0-5 (default 1 = 20%, "
+                 "0 lets the curve stop the fans)");
+
+/*
  * Load guard. The driver writes EC registers, so it only loads on a board
  * and EC firmware whose register map has been checked. Anything else gets
  * -ENODEV, unless the admin names it with the allow_board parameter.
@@ -493,7 +504,8 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
             }
             mutex_unlock(&ec_curve_lock);
 
-            ret = write_fan_level(fan, initial_level);
+            ret = write_fan_level(fan, max_t(u8, initial_level,
+                                             curve_min_level));
             if (ret)
                 return ret;
         }
@@ -872,9 +884,12 @@ static void ec_update_worker(struct work_struct *work)
 
             ret = 0;
 
-            if (level < 5 && temp >= fan->rampup_curve[level + 1]) {
+            if (level < curve_min_level) {
+                ret = write_fan_level(fan, curve_min_level);
+            } else if (level < 5 && temp >= fan->rampup_curve[level + 1]) {
                 ret = write_fan_level(fan, level + 1);
-            } else if (level > 0 && temp <= fan->rampdown_curve[level]) {
+            } else if (level > curve_min_level &&
+                       temp <= fan->rampdown_curve[level]) {
                 ret = write_fan_level(fan, level - 1);
             }
             if (ret)
@@ -908,6 +923,11 @@ static int __init ec_su_axb35_init(void)
     ret = ec_check_board();
     if (ret)
         return ret;
+
+    if (curve_min_level > 5) {
+        pr_err("ec_su_axb35: curve_min_level must be 0-5\n");
+        return -EINVAL;
+    }
 
     ret = alloc_chrdev_region(&ec_su_axb35_dev, 0, EC_NUM_DEVICES,
                               "ec_su_axb35");
