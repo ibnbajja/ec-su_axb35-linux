@@ -78,6 +78,9 @@ static struct ec_apu ec_apu = {
     .power_mode_reg = 0x31,
 };
 
+/* Serializes curve updates with each other and with the curve readers */
+static DEFINE_MUTEX(ec_curve_lock);
+
 /*
  * Load guard. The driver writes EC registers, so it only loads on a board
  * and EC firmware whose register map has been checked. Anything else gets
@@ -481,12 +484,14 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
 
             // Find the appropriate level based on current temperature
             // Use rampup curve for initial positioning to be more responsive
+            mutex_lock(&ec_curve_lock);
             for (i = 5; i > 0; i--) {
                 if (temp >= fan->rampup_curve[i]) {
                     initial_level = i;
                     break;
                 }
             }
+            mutex_unlock(&ec_curve_lock);
 
             ret = write_fan_level(fan, initial_level);
             if (ret)
@@ -500,31 +505,61 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
 static struct device_attribute dev_attr_fan_mode =
     __ATTR(mode, 0644, fan_mode_show, fan_mode_store);
 
+/*
+ * A curve pair is valid when the rampup thresholds strictly increase and
+ * every rampdown threshold is below the rampup threshold of the same level,
+ * so the worker can never step a fan up and straight back down at one
+ * temperature.
+ */
+static bool fan_curves_valid(const u8 *rampup, const u8 *rampdown)
+{
+    int i;
+
+    for (i = 1; i < 6; i++) {
+        if (i > 1 && rampup[i] <= rampup[i - 1])
+            return false;
+        if (rampdown[i] >= rampup[i])
+            return false;
+    }
+    return true;
+}
+
 static ssize_t fan_curve_show(u8 *curve, char *buf)
 {
     int   i;
     char *p = buf;
 
+    mutex_lock(&ec_curve_lock);
     for (i = 1; i < 6; i++) {
         p += sprintf(p, "%d", curve[i]);
         if (i < 5) {
             *p++ = ',';
         }
     }
+    mutex_unlock(&ec_curve_lock);
     *p++ = '\n';
     *p   = '\0';
 
     return p - buf;
 }
 
-static ssize_t fan_curve_store(u8 *curve, const char *buf, size_t count)
+/*
+ * Replaces one of the fan's two curves. The new curve is checked together
+ * with the fan's other curve, so the order of writes matters: writing
+ * rampdown "0,0,0,0,0" first always leaves room for any valid rampup.
+ */
+static ssize_t fan_curve_store(struct ec_fan *fan, bool is_rampup,
+                               const char *buf, size_t count)
 {
     char *orig = kstrndup(buf, count, GFP_KERNEL);
     char *str  = orig;
     char *token;
     int   values[5];
-    int   i   = 0;
-    int   ret = 0;
+    u8    rampup[6];
+    u8    rampdown[6];
+    u8   *curve = is_rampup ? rampup : rampdown;
+    int   i     = 0;
+    int   ret   = 0;
 
     if (!orig)
         return -ENOMEM;
@@ -543,13 +578,24 @@ static ssize_t fan_curve_store(u8 *curve, const char *buf, size_t count)
         token = strsep(&str, ",");
     }
 
-    if (i != 5)
+    // exactly five values
+    if (i != 5 || token)
         ret = -EINVAL;
 
     if (ret == 0) {
+        mutex_lock(&ec_curve_lock);
+        memcpy(rampup, fan->rampup_curve, sizeof(rampup));
+        memcpy(rampdown, fan->rampdown_curve, sizeof(rampdown));
         for (i = 0; i < 5; i++) {
             curve[i + 1] = values[i];
         }
+        if (fan_curves_valid(rampup, rampdown)) {
+            memcpy(fan->rampup_curve, rampup, sizeof(rampup));
+            memcpy(fan->rampdown_curve, rampdown, sizeof(rampdown));
+        } else {
+            ret = -EINVAL;
+        }
+        mutex_unlock(&ec_curve_lock);
     }
 
     kfree(orig);
@@ -568,7 +614,7 @@ static ssize_t fan_rampup_curve_store(struct device           *dev,
                                       const char *buf, size_t count)
 {
     struct ec_fan *fan = dev_get_drvdata(dev);
-    return fan_curve_store(fan->rampup_curve, buf, count);
+    return fan_curve_store(fan, true, buf, count);
 }
 
 static struct device_attribute dev_attr_fan_rampup_curve =
@@ -586,7 +632,7 @@ static ssize_t fan_rampdown_curve_store(struct device           *dev,
                                         const char *buf, size_t count)
 {
     struct ec_fan *fan = dev_get_drvdata(dev);
-    return fan_curve_store(fan->rampdown_curve, buf, count);
+    return fan_curve_store(fan, false, buf, count);
 }
 
 static struct device_attribute dev_attr_fan_rampdown_curve = __ATTR(
@@ -814,6 +860,7 @@ static void ec_update_worker(struct work_struct *work)
         ec_temp.temp_max = temp;
 
     // update fan level if curve mode is active
+    mutex_lock(&ec_curve_lock);
     for (i = 0; i < ARRAY_SIZE(ec_fans); i++) {
         struct ec_fan *fan = &ec_fans[i];
 
@@ -835,6 +882,7 @@ static void ec_update_worker(struct work_struct *work)
                                     fan->name, ret);
         }
     }
+    mutex_unlock(&ec_curve_lock);
 
 requeue:
     // Requeue the work
