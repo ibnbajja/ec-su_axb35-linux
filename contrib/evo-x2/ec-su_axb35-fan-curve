@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ec-su_axb35-fan-curve - apply or release the fan curves from
-# /etc/ec-su_axb35/fan-curve.conf (installed as /usr/local/libexec/).
+# /etc/ec-su_axb35/fan-curve.conf (installed as /usr/local/sbin/).
 #
 #   start   fan1-3: write both curves, then mode=curve
 #   stop    fan1-3: mode=auto (the EC's own fan control)

@@ -96,7 +96,7 @@ curve_min_level  lowest level in curve mode, 0-5 (default 1; 0 lets the curve st
 | File | Installed as |
 |---|---|
 | `ec-su_axb35-fan-curve.service` | `/etc/systemd/system/` - oneshot: `modprobe`, curves + `mode=curve` for fan1-3; stop = `mode=auto` |
-| `ec-su_axb35-fan-curve` | `/usr/local/libexec/` - `start`, `stop`, `status`; never writes `apu/power_mode` |
+| `ec-su_axb35-fan-curve` | `/usr/local/sbin/` - `start`, `stop`, `status`; never writes `apu/power_mode` |
 | `fan-curve.conf` | `/etc/ec-su_axb35/fan-curve.conf` - fan1/fan2 100% at 88 °C, fan3 at 85 °C, never off |
 | `ec-su_axb35-check` | `/usr/local/bin/` - samples gpu_metrics + hwmon for N minutes, prints averages + a JSON line |
 | `ec-su_axb35-abc` | `/usr/local/sbin/` - runs fan settings back to back (settle, then `ec-su_axb35-check`), with a temperature watchdog |
@@ -110,18 +110,19 @@ unit also stops it loading at boot.
 
 Secure Boot is off on the target, so module signing is not needed. DKMS still creates
 `/var/lib/dkms/mok.{key,pub}` and signs the module with it; that is harmless.
-`kernel-devel` for the running kernel must be installed.
+`kernel-devel` for the running kernel must be installed. Installing `dkms` also enables
+`dkms.service`, which builds the module for a new kernel at boot.
 
 ```
 git clone https://github.com/ibnbajja/ec-su_axb35-linux ~/Dev/ec-su_axb35-linux
-cd ~/Dev/ec-su_axb35-linux && git checkout evo-x2-2026.10.10   # the reviewed tag
+cd ~/Dev/ec-su_axb35-linux && git checkout evo-x2-2026.10.10-2   # the reviewed tag
 sudo dnf install dkms
 sudo install -D -m0644 contrib/evo-x2/dkms-framework.conf /etc/dkms/framework.conf.d/ec_su_axb35.conf
 git archive --prefix=ec_su_axb35-2026.10.10/ HEAD | sudo tar -x -C /usr/src
 sudo dkms install ec_su_axb35/2026.10.10       # add + build + install for the running kernel
 sudo modprobe ec_su_axb35                      # read-only: fans keep their firmware state
 sudo install -D -m0644 contrib/evo-x2/fan-curve.conf /etc/ec-su_axb35/fan-curve.conf
-sudo install -D -m0755 contrib/evo-x2/ec-su_axb35-fan-curve /usr/local/libexec/ec-su_axb35-fan-curve
+sudo install -D -m0755 contrib/evo-x2/ec-su_axb35-fan-curve /usr/local/sbin/ec-su_axb35-fan-curve
 sudo install -D -m0755 contrib/evo-x2/ec-su_axb35-check /usr/local/bin/ec-su_axb35-check
 sudo install -D -m0755 contrib/evo-x2/ec-su_axb35-abc /usr/local/sbin/ec-su_axb35-abc
 sudo install -D -m0755 contrib/evo-x2/embed-load /usr/local/bin/embed-load
@@ -137,7 +138,7 @@ After `modprobe`, before enabling the unit:
 
 ```
 sudo dmesg | grep ec_su_axb35        # "driver loaded"; no "refusing to load"
-sudo /usr/local/libexec/ec-su_axb35-fan-curve status
+sudo /usr/local/sbin/ec-su_axb35-fan-curve status
 sensors 'ec_su_axb35-*'
 ```
 
@@ -150,7 +151,7 @@ After `systemctl enable --now`:
 
 ```
 systemctl status ec-su_axb35-fan-curve.service
-sudo /usr/local/libexec/ec-su_axb35-fan-curve status   # mode curve, the configured curves; level 5 above 88 °C
+sudo /usr/local/sbin/ec-su_axb35-fan-curve status   # mode curve, the configured curves; level 5 above 88 °C
 ```
 
 ## A/B/C check
@@ -188,9 +189,10 @@ from this install is left. Step 5 restores the exact firmware fan state:
 2. `sudo modprobe -r ec_su_axb35`: the driver stops its worker and resets fans to AUTO again.
 3. `sudo dkms remove ec_su_axb35/2026.10.10 --all && sudo rm -rf /usr/src/ec_su_axb35-2026.10.10`.
 4. Remove the installed files and reload:
-   `sudo rm -f /etc/systemd/system/ec-su_axb35-fan-curve.service /usr/local/libexec/ec-su_axb35-fan-curve /usr/local/bin/ec-su_axb35-check /etc/dkms/framework.conf.d/ec_su_axb35.conf && sudo rm -rf /etc/ec-su_axb35 && sudo systemctl daemon-reload`.
+   `sudo rm -f /etc/systemd/system/ec-su_axb35-fan-curve.service /usr/local/sbin/ec-su_axb35-fan-curve /usr/local/bin/ec-su_axb35-check /etc/dkms/framework.conf.d/ec_su_axb35.conf && sudo rm -rf /etc/ec-su_axb35 && sudo systemctl daemon-reload`.
    There is no `/etc/modules-load.d` entry to remove (`ls /etc/modules-load.d` to confirm).
-   Optionally `sudo dnf remove dkms` and `sudo rm -f /var/lib/dkms/mok.key /var/lib/dkms/mok.pub`.
+   Optionally `sudo dnf remove dkms` (also removes `dkms.service`) and
+   `sudo rm -f /var/lib/dkms/mok.key /var/lib/dkms/mok.pub`.
 5. Reboot when convenient: the BIOS re-applies its smart-fan setting (the exact pre-install state).
 
 ## Source vetting (2026-10-10)

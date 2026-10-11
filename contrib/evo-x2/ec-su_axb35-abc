@@ -19,7 +19,7 @@
 set -euo pipefail
 
 SYS=${EC_SU_AXB35_SYSFS:-/sys/class/ec_su_axb35}
-CURVE_CMD=${EC_FAN_CURVE_CMD:-/usr/local/libexec/ec-su_axb35-fan-curve}
+CURVE_CMD=${EC_FAN_CURVE_CMD:-/usr/local/sbin/ec-su_axb35-fan-curve}
 CHECK_CMD=${EC_CHECK_CMD:-/usr/local/bin/ec-su_axb35-check}
 
 settle=3 minutes=10 max_temp=105 counter=""
