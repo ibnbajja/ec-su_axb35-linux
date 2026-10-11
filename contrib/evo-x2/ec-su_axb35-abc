@@ -9,8 +9,8 @@
 #   fixed:N   mode=fixed, level N for fan1-3 (1-5 = 20-100%)
 #   curve     ec-su_axb35-fan-curve start: the configured curves
 #
-# For each arm: set the fans, wait --settle minutes (default 3), then sample with
-# ec-su_axb35-check for --minutes (default 10). Start the load first (e.g. embed-load) and
+# For each arm: set the fans, wait --settle minutes (default 2), then sample with
+# ec-su_axb35-check for --minutes (default 3). Start the load first (e.g. embed-load) and
 # keep it running for the whole run; with --load-counter, each arm also reports embeddings/s.
 #
 # A watchdog applies the curve and ends the run if the EC temperature reaches --max-temp
@@ -22,7 +22,7 @@ SYS=${EC_SU_AXB35_SYSFS:-/sys/class/ec_su_axb35}
 CURVE_CMD=${EC_FAN_CURVE_CMD:-/usr/local/sbin/ec-su_axb35-fan-curve}
 CHECK_CMD=${EC_CHECK_CMD:-/usr/local/bin/ec-su_axb35-check}
 
-settle=3 minutes=10 max_temp=105 counter=""
+settle=2 minutes=3 max_temp=105 counter=""
 out=/var/tmp/ec-su_axb35-abc-$(date +%Y%m%d-%H%M%S)
 
 usage() {

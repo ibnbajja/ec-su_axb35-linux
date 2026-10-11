@@ -156,8 +156,8 @@ sudo /usr/local/sbin/ec-su_axb35-fan-curve status   # mode curve, the configured
 
 ## A/B/C check
 
-Three fan settings back to back under one constant load. Each gets 3 minutes to settle,
-then 10 minutes of sampling:
+Three fan settings back to back under one constant load, on a host already warm from that load.
+Each gets 2 minutes to settle, then 3 minutes of sampling (`--settle`, `--minutes`):
 
 | Arm | Setting | Why |
 |---|---|---|
