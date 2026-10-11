@@ -950,6 +950,11 @@ static int __init ec_su_axb35_init(void)
     for (i = 0; i < ARRAY_SIZE(ec_fans); i++) {
         struct ec_fan *fan = &ec_fans[i];
 
+        // A fan the BIOS left in manual mode keeps its level (FIXED, see
+        // update_fan_mode) until curve mode is requested, so loading the
+        // module changes nothing.
+        fan->mode = FIXED;
+
         fan->dev = device_create(
             ec_class, NULL, MKDEV(MAJOR(ec_su_axb35_dev), i), fan, fan->name);
         if (IS_ERR(fan->dev))
