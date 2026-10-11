@@ -82,7 +82,7 @@ hwmon device folded into the main module. On top of that:
 | `curve_min_level` parameter (default 1 = 20%) | The curve never stops a fan: not on the switch to curve mode, not when cooling down |
 | Loading leaves fans in their firmware state (manual mode shows as `fixed`) | `modprobe` alone changes nothing; only `mode=curve` hands a fan to the driver |
 | Unload stops the curve worker before resetting fans to AUTO | No level write after the reset |
-| `dkms.conf`, `contrib/evo-x2/` | DKMS install, systemd unit, A/B check script |
+| `dkms.conf`, `contrib/evo-x2/` | DKMS install, systemd unit, A/B/C check tools |
 
 Module parameters (read-only after load):
 
@@ -99,6 +99,8 @@ curve_min_level  lowest level in curve mode, 0-5 (default 1; 0 lets the curve st
 | `ec-su_axb35-fan-curve` | `/usr/local/libexec/` - `start`, `stop`, `status`; never writes `apu/power_mode` |
 | `fan-curve.conf` | `/etc/ec-su_axb35/fan-curve.conf` - fan1/fan2 100% at 88 °C, fan3 at 85 °C, never off |
 | `ec-su_axb35-check` | `/usr/local/bin/` - samples gpu_metrics + hwmon for N minutes, prints averages + a JSON line |
+| `ec-su_axb35-abc` | `/usr/local/sbin/` - runs fan settings back to back (settle, then `ec-su_axb35-check`), with a temperature watchdog |
+| `embed-load` | `/usr/local/bin/` - constant load on an OpenAI-compatible `/v1/embeddings` endpoint, with an embeddings counter |
 | `dkms-framework.conf` | `/etc/dkms/framework.conf.d/ec_su_axb35.conf` - skips Fedora's `dracut --regenerate-all` after DKMS transactions (this module is not needed in the initramfs) |
 
 There is deliberately no `/etc/modules-load.d` entry: the unit loads the module, so disabling the
@@ -111,7 +113,7 @@ Secure Boot is off on the target, so module signing is not needed. DKMS still cr
 `kernel-devel` for the running kernel must be installed.
 
 ```
-git clone https://github.com/OWNER/ec-su_axb35-linux ~/Dev/ec-su_axb35-linux
+git clone https://github.com/ibnbajja/ec-su_axb35-linux ~/Dev/ec-su_axb35-linux
 cd ~/Dev/ec-su_axb35-linux && git checkout evo-x2-2026.10.10   # the reviewed tag
 sudo dnf install dkms
 sudo install -D -m0644 contrib/evo-x2/dkms-framework.conf /etc/dkms/framework.conf.d/ec_su_axb35.conf
@@ -121,6 +123,8 @@ sudo modprobe ec_su_axb35                      # read-only: fans keep their firm
 sudo install -D -m0644 contrib/evo-x2/fan-curve.conf /etc/ec-su_axb35/fan-curve.conf
 sudo install -D -m0755 contrib/evo-x2/ec-su_axb35-fan-curve /usr/local/libexec/ec-su_axb35-fan-curve
 sudo install -D -m0755 contrib/evo-x2/ec-su_axb35-check /usr/local/bin/ec-su_axb35-check
+sudo install -D -m0755 contrib/evo-x2/ec-su_axb35-abc /usr/local/sbin/ec-su_axb35-abc
+sudo install -D -m0755 contrib/evo-x2/embed-load /usr/local/bin/embed-load
 sudo install -D -m0644 contrib/evo-x2/ec-su_axb35-fan-curve.service /etc/systemd/system/ec-su_axb35-fan-curve.service
 sudo systemctl daemon-reload
 # verify (below), then hand the fans to the curve:
@@ -149,18 +153,29 @@ systemctl status ec-su_axb35-fan-curve.service
 sudo /usr/local/libexec/ec-su_axb35-fan-curve status   # mode curve, the configured curves; level 5 above 88 °C
 ```
 
-## A/B check
+## A/B/C check
 
-Run both arms under the same load, 10 minutes each:
+Three fan settings back to back under one constant load. Each gets 3 minutes to settle,
+then 10 minutes of sampling:
+
+| Arm | Setting | Why |
+|---|---|---|
+| A | `auto` | The EC's own control. Stands in for the BIOS default (smart fan off) and is the rollback state |
+| B | `fixed:3` | 60%, what one would set by hand in the BIOS |
+| C | `curve` | The configured curves (100% above 88 °C) |
 
 ```
-ec-su_axb35-check --minutes 10 --label firmware-80 --csv /tmp/fan-a.csv   # module loaded, unit not started
+embed-load --counter /tmp/embed-load.count >/tmp/embed-load.log 2>&1 &   # embedder on 127.0.0.1:8000
+sudo ec-su_axb35-abc --load-counter /tmp/embed-load.count auto fixed:3 curve
+kill %1
 sudo systemctl enable --now ec-su_axb35-fan-curve.service
-ec-su_axb35-check --minutes 10 --label curve --csv /tmp/fan-b.csv
 ```
 
-Compare: average gfxclk, gfx temperature, thm_gfx residency % (100% = the iGPU is clocked down
-for heat the whole time), socket power, and fan RPMs.
+The runner prints one row per arm: average gfxclk, gfx temperature, thm_gfx/thm_core residency %
+(100% = the iGPU is clocked down for heat the whole time), socket power, gfx activity,
+EC temperature, fan RPMs and embeddings/s. If the EC temperature reaches 105 °C (`--max-temp`),
+a watchdog puts the fans on the curve and stops the run. The fans also go to the curve if the
+run is killed. Results go to `/var/tmp/ec-su_axb35-abc-<time>/`.
 
 ## Rollback
 
@@ -207,5 +222,6 @@ Evidence:
 - Every commit in this fork builds warning-free (`W=1`) against `kernel-devel-7.2.8-200.fc44`.
   The DKMS flow and the unit were also tested in a Fedora 44 container.
 
-The driver is below the "widely adopted" bar for production sources (no releases, about 80 stars),
-so using it needs the owner's explicit exception. That exception is recorded with the install.
+The driver is below the "widely adopted" bar for production sources (no releases, about 80 stars).
+The owner approved it as an explicit exception on 2026-10-10, together with the install on the
+EVO-X2 and the A/B/C run.
