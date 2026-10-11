@@ -115,7 +115,7 @@ Secure Boot is off on the target, so module signing is not needed. DKMS still cr
 
 ```
 git clone https://github.com/ibnbajja/ec-su_axb35-linux ~/Dev/ec-su_axb35-linux
-cd ~/Dev/ec-su_axb35-linux && git checkout evo-x2-2026.10.10-2   # the reviewed tag
+cd ~/Dev/ec-su_axb35-linux && git checkout evo-x2-2026.10.10-3   # the reviewed tag
 sudo dnf install dkms
 sudo install -D -m0644 contrib/evo-x2/dkms-framework.conf /etc/dkms/framework.conf.d/ec_su_axb35.conf
 git archive --prefix=ec_su_axb35-2026.10.10/ HEAD | sudo tar -x -C /usr/src
@@ -177,6 +177,26 @@ The runner prints one row per arm: average gfxclk, gfx temperature, thm_gfx/thm_
 EC temperature, fan RPMs and embeddings/s. If the EC temperature reaches 105 °C (`--max-temp`),
 a watchdog puts the fans on the curve and stops the run. The fans also go to the curve if the
 run is killed. Results go to `/var/tmp/ec-su_axb35-abc-<time>/`.
+
+### Results on our EVO-X2 (2026-10-10)
+
+This run used one synthetic load (2 concurrent requests of 20 texts to an Octen-Embedding-8B ROCm
+embedder on the iGPU), after 3 minutes of warm-up at the BIOS fixed 80%. Each arm then had
+2 minutes to settle and 3 minutes of sampling, at 180 samples:
+
+| Arm | gfxclk avg | gfx °C | thm_gfx | thm_core | socket W | fan1 / fan2 / fan3 rpm | embeddings/s |
+|---|---|---|---|---|---|---|---|
+| A `auto` | 1,653 MHz | 98.4 | 99.9% | 92.0% | 77.9 | 3,145 / 3,385 / 975 | 2.72 |
+| B `fixed:3` (60%) | 1,648 MHz | 98.1 | 99.9% | 93.7% | 78.3 | 3,293 / 3,386 / 1,267 | 2.71 |
+| C `curve` (100% at load) | 1,899 MHz | 97.9 | 99.8% | 87.4% | 82.9 | 4,386 / 4,518 / 1,936 | 2.90 |
+
+- The curve clocks the iGPU 15% higher than EC auto or 60% (+250 MHz). Embedder throughput rises
+  about 7% (embeddings/s is ±~4% at this window length).
+- The iGPU stays at its thermal limit even at 100% fans (thm_gfx ≈ 100%, gfx ≈ 98 °C). More
+  cooling, such as better thermal paste, is the next lever.
+- An earlier 20 s sample at the BIOS fixed 80% averaged ~1.85 GHz.
+- At idle the curve steps down to the 20% floor (~1,900 / 1,950 / 400 rpm at EC 47-49 °C) and
+  never stops a fan.
 
 ## Rollback
 
