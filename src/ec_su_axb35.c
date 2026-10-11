@@ -1013,6 +1013,10 @@ static void __exit ec_su_axb35_exit(void)
 {
     int i;
 
+    // Stop the curve worker first, so it cannot write a level after the
+    // fans are handed back to the EC below.
+    cancel_delayed_work_sync(&ec_update_work);
+
     if (ec_hwmon_dev) {
         hwmon_device_unregister(ec_hwmon_dev);
         ec_hwmon_dev = NULL;
@@ -1071,8 +1075,6 @@ static void __exit ec_su_axb35_exit(void)
         device_remove_file(ec_apu.dev, &dev_attr_apu_power_mode);
         device_destroy(ec_class, MKDEV(MAJOR(ec_su_axb35_dev), EC_MINOR_APU));
     }
-
-    cancel_delayed_work_sync(&ec_update_work);
 
     class_destroy(ec_class);
     unregister_chrdev_region(ec_su_axb35_dev, EC_NUM_DEVICES);
