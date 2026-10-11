@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""embed-load - constant load on an OpenAI-compatible /v1/embeddings endpoint.
+
+Keeps --concurrency requests in flight, each with --batch unique texts of --words
+random words (unique, so no server-side cache can help). After every request it
+rewrites --counter with "<unix time> <embeddings done> <errors>", so another
+process can compute embeddings/s over any window. Runs until --minutes or Ctrl-C.
+
+  embed-load --url http://127.0.0.1:8000/v1/embeddings --counter /tmp/embed-load.count
+"""
+import argparse
+import json
+import os
+import random
+import sys
+import threading
+import time
+import urllib.request
+
+VOCAB = (
+    "council meeting agenda minutes vote motion second approved denied budget fiscal year fund revenue "
+    "expenditure ordinance resolution public hearing zoning permit planning commission staff report city "
+    "manager attorney clerk mayor member district street park water sewer police fire library housing grant "
+    "contract amendment item consent calendar closed session recess adjourn presentation item discussion "
+    "recommendation project capital improvement program transportation traffic safety community development"
+).split()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--url", default="http://127.0.0.1:8000/v1/embeddings")
+    ap.add_argument("--model", default="", help="sent as \"model\" when set")
+    ap.add_argument("--concurrency", type=int, default=2)
+    ap.add_argument("--batch", type=int, default=20, help="texts per request")
+    ap.add_argument("--words", type=int, default=300, help="words per text")
+    ap.add_argument("--minutes", type=float, default=0, help="stop after this long (0 = until killed)")
+    ap.add_argument("--counter", default="/tmp/embed-load.count")
+    ap.add_argument("--timeout", type=float, default=300)
+    args = ap.parse_args()
+
+    lock = threading.Lock()
+    state = {"done": 0, "errors": 0}
+    stop = threading.Event()
+
+    def write_counter():
+        tmp = args.counter + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{time.time():.3f} {state['done']} {state['errors']}\n")
+        os.replace(tmp, args.counter)
+
+    def worker(seed):
+        rng = random.Random(seed)
+        while not stop.is_set():
+            texts = [" ".join(rng.choices(VOCAB, k=args.words)) + f" {rng.getrandbits(64):x}"
+                     for _ in range(args.batch)]
+            body = {"input": texts}
+            if args.model:
+                body["model"] = args.model
+            req = urllib.request.Request(args.url, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=args.timeout) as r:
+                    n = len(json.load(r)["data"])
+                ok = True
+            except Exception as e:  # keep the load running; count and report errors
+                print(f"request failed: {e}", file=sys.stderr)
+                ok, n = False, 0
+            with lock:
+                state["done"] += n
+                state["errors"] += 0 if ok else 1
+                write_counter()
+            if not ok:
+                stop.wait(5)
+
+    with lock:
+        write_counter()
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(args.concurrency)]
+    for t in threads:
+        t.start()
+    t0 = time.monotonic()
+    try:
+        while not stop.is_set():
+            stop.wait(30)
+            el = time.monotonic() - t0
+            print(f"{el / 60:.1f} min: {state['done']} embeddings, {state['done'] / el:.1f}/s, "
+                  f"{state['errors']} errors", file=sys.stderr, flush=True)
+            if args.minutes and el >= args.minutes * 60:
+                stop.set()
+    except KeyboardInterrupt:
+        stop.set()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# ec-su_axb35-abc - compare fan settings back to back under the same load (run as root).
+#
+#   ec-su_axb35-abc [--settle MIN] [--minutes MIN] [--max-temp C] [--out DIR]
+#                   [--load-counter FILE] ARM...
+#
+# ARM is one of:
+#   auto      mode=auto for fan1-3: the EC's own control
+#   fixed:N   mode=fixed, level N for fan1-3 (1-5 = 20-100%)
+#   curve     ec-su_axb35-fan-curve start: the configured curves
+#
+# For each arm: set the fans, wait --settle minutes (default 3), then sample with
+# ec-su_axb35-check for --minutes (default 10). Start the load first (e.g. embed-load) and
+# keep it running for the whole run; with --load-counter, each arm also reports embeddings/s.
+#
+# A watchdog applies the curve and ends the run if the EC temperature reaches --max-temp
+# (default 105 °C). If the run ends any other way than finishing, the fans are put on the
+# curve too. After a finished run the fans stay in the last arm's setting.
+set -euo pipefail
+
+SYS=${EC_SU_AXB35_SYSFS:-/sys/class/ec_su_axb35}
+CURVE_CMD=${EC_FAN_CURVE_CMD:-/usr/local/libexec/ec-su_axb35-fan-curve}
+CHECK_CMD=${EC_CHECK_CMD:-/usr/local/bin/ec-su_axb35-check}
+
+settle=3 minutes=10 max_temp=105 counter=""
+out=/var/tmp/ec-su_axb35-abc-$(date +%Y%m%d-%H%M%S)
+
+usage() {
+    sed -n '2,20s/^# \{0,1\}//p' "$0" >&2
+    exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --settle) settle=$2; shift 2 ;;
+    --minutes) minutes=$2; shift 2 ;;
+    --max-temp) max_temp=$2; shift 2 ;;
+    --out) out=$2; shift 2 ;;
+    --load-counter) counter=$2; shift 2 ;;
+    -h | --help) usage ;;
+    -*) usage ;;
+    *) break ;;
+    esac
+done
+[[ $# -gt 0 ]] || usage
+arms=("$@")
+for arm in "${arms[@]}"; do
+    [[ $arm =~ ^(auto|curve|fixed:[1-5])$ ]] || { echo "unknown arm: $arm" >&2; usage; }
+done
+[[ -d $SYS ]] || { echo "$SYS missing: is ec_su_axb35 loaded?" >&2; exit 1; }
+[[ -z $counter || -r $counter ]] || { echo "cannot read $counter" >&2; exit 1; }
+
+mkdir -p "$out"
+log() { echo "$(date +%T) $*" | tee -a "$out/run.log" >&2; }
+
+set_arm() {
+    local n
+    case $1 in
+    auto)
+        for n in 1 2 3; do echo auto >"$SYS/fan$n/mode"; done
+        ;;
+    fixed:*)
+        for n in 1 2 3; do
+            echo fixed >"$SYS/fan$n/mode"
+            echo "${1#fixed:}" >"$SYS/fan$n/level"
+        done
+        ;;
+    curve)
+        "$CURVE_CMD" start
+        ;;
+    esac
+}
+
+# minutes (may be fractional) to whole seconds
+seconds() { awk -v m="$1" 'BEGIN { printf "%d", m * 60 }'; }
+
+# "<unix time> <embeddings>" from the load counter
+load_mark() { [[ -n $counter ]] && awk '{ print $1, $2 }' "$counter"; }
+
+finished=0 child=""
+cleanup() {
+    local rc=$?
+    # either may have exited already
+    kill "${watchdog_pid:-}" ${child:+"$child"} 2>/dev/null || true
+    if [[ $finished -ne 1 ]]; then
+        log "run did not finish: putting the fans on the curve"
+        "$CURVE_CMD" start || log "could not apply the curve!"
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+main_pid=$$
+(
+    while sleep 2; do
+        t=$(<"$SYS/temp1/temp") || continue
+        if ((t >= max_temp)); then
+            log "watchdog: EC $t °C >= $max_temp °C, applying the curve and stopping the run"
+            "$CURVE_CMD" start || true
+            touch "$out/ABORTED"
+            kill -TERM "$main_pid"
+            exit 0
+        fi
+    done
+) &
+watchdog_pid=$!
+
+log "arms: ${arms[*]}; settle $settle min, sample $minutes min, watchdog at $max_temp °C; output $out"
+for arm in "${arms[@]}"; do
+    label=${arm/:/-}
+    log "arm $arm: setting fans"
+    set_arm "$arm"
+    log "arm $arm: settling $settle min"
+    sleep "$(seconds "$settle")" &
+    child=$!
+    wait "$child"
+    m0=$(load_mark || true)
+    log "arm $arm: sampling $minutes min"
+    "$CHECK_CMD" --minutes "$minutes" --label "$arm" --csv "$out/$label.csv" >"$out/$label.txt" &
+    child=$!
+    wait "$child"
+    child=""
+    m1=$(load_mark || true)
+    if [[ -n $m0 && -n $m1 ]]; then
+        read -r t0 n0 <<<"$m0"
+        read -r t1 n1 <<<"$m1"
+        awk -v t0="$t0" -v t1="$t1" -v n0="$n0" -v n1="$n1" -v arm="$arm" \
+            'BEGIN { printf "{\"label\": \"%s\", \"embeddings\": %d, \"embeddings_per_s\": %.2f}\n", arm, n1 - n0, (n1 - n0) / (t1 - t0) }' \
+            >"$out/$label.load"
+    fi
+    log "arm $arm: done ($(grep -o '"thm_gfx_residency_pct": [0-9.]*' "$out/$label.txt" || echo 'no summary'))"
+done
+finished=1
+
+python3 - "$out" "${arms[@]}" <<'EOF' | tee "$out/summary.txt"
+import json, sys
+out, arms = sys.argv[1], sys.argv[2:]
+cols = [("arm", "label"), ("gfxclk MHz", "gfxclk_mhz_avg"), ("gfx °C", "gfx_temp_c_avg"),
+        ("thm_gfx %", "thm_gfx_residency_pct"), ("thm_core %", "thm_core_residency_pct"),
+        ("socket W", "socket_w_avg"), ("gfx act %", "gfx_activity_pct_avg"), ("EC °C", "ec_temp_c_avg"),
+        ("fan1 rpm", "fan1_rpm_avg"), ("fan2 rpm", "fan2_rpm_avg"), ("fan3 rpm", "fan3_rpm_avg"),
+        ("emb/s", "embeddings_per_s")]
+rows = []
+for arm in arms:
+    label = arm.replace(":", "-")
+    s = {}
+    for line in open(f"{out}/{label}.txt"):
+        if line.startswith("json "):
+            s = json.loads(line[5:])
+    try:
+        s.update(json.load(open(f"{out}/{label}.load")))
+    except OSError:
+        pass
+    rows.append([str(s.get(k, "n/a")) for _, k in cols])
+widths = [max(len(h), *(len(r[i]) for r in rows)) for i, (h, _) in enumerate(cols)]
+print("  ".join(h.ljust(w) for (h, _), w in zip(cols, widths)))
+for r in rows:
+    print("  ".join(v.ljust(w) for v, w in zip(r, widths)))
+EOF
