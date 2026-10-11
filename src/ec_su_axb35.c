@@ -519,13 +519,14 @@ static ssize_t fan_curve_show(u8 *curve, char *buf)
 
 static ssize_t fan_curve_store(u8 *curve, const char *buf, size_t count)
 {
-    char *str = kstrndup(buf, count, GFP_KERNEL);
+    char *orig = kstrndup(buf, count, GFP_KERNEL);
+    char *str  = orig;
     char *token;
     int   values[5];
     int   i   = 0;
     int   ret = 0;
 
-    if (!str)
+    if (!orig)
         return -ENOMEM;
 
     token = strsep(&str, ",");
@@ -551,7 +552,7 @@ static ssize_t fan_curve_store(u8 *curve, const char *buf, size_t count)
         }
     }
 
-    kfree(str);
+    kfree(orig);
     return ret ? ret : count;
 }
 
